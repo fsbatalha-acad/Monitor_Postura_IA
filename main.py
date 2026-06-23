@@ -3,7 +3,9 @@ import mediapipe as mp
 import time
 import os
 import sys
-import winsound  # Biblioteca nativa do Windows para emitir bipes
+import math
+import winsound
+import numpy as np  # Suporte à criação do kernel de nitidez
 
 # Função para garantir que o executável ache o arquivo da IA
 def encontra_caminho_recurso(caminho_relativo):
@@ -19,13 +21,19 @@ PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
+caminho_modelo = encontra_caminho_recurso('pose_landmarker_full.task')
+with open(caminho_modelo, 'rb') as f:
+    modelo_bytes = f.read()
+
 options = PoseLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=encontra_caminho_recurso('pose_landmarker_full.task')),
+    base_options=BaseOptions(model_asset_buffer=modelo_bytes),
     running_mode=VisionRunningMode.VIDEO
 )
 
-# VARIÁVEIS DE CONTROLE DA POSTURA E TEMPO
-distancia_referencia = None  
+# VARIÁVEIS DE CONTROLE DA POSTURA EM 3D (Ângulos em Graus)
+ref_frontal = None  # Pitch
+ref_lateral = None  # Roll
+ref_rotacao = None  # Yaw
 calibrado = False
 tempo_inicio_postura_ruim = None  
 
@@ -41,6 +49,16 @@ ultimo_bip = 0
 # Variáveis globais para os comandos dos botões
 comando_calibrar = False
 comando_encerrar = False
+
+# Configuração do CLAHE para o tratamento de contraste
+clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
+# Kernel de Nitidez
+kernel_nitidez = np.array([
+    [ 0, -1,  0],
+    [-1,  5, -1],
+    [ 0, -1,  0]
+])
 
 # FUNÇÃO QUE DETECTA CLIQUES DO MOUSE
 def detectar_clique(event, x, y, flags, param):
@@ -58,8 +76,24 @@ cv2.setMouseCallback("Monitor de Postura", detectar_clique)
 
 tempo_inicio_sessao = None
 
+# FUNÇÃO PARA CALCULAR OS 3 ÂNGULOS DO PESCOÇO EM 3D
+def calcular_angulos_3d(nariz, ombro_esq, ombro_dir):
+    cx = (ombro_esq.x + ombro_dir.x) / 2
+    cy = (ombro_esq.y + ombro_dir.y) / 2
+    cz = (ombro_esq.z + ombro_dir.z) / 2
+    
+    dx = nariz.x - cx
+    dy = cy - nariz.y  # Invertido porque o Y do MediaPipe cresce para baixo
+    dz = cz - nariz.z  # Z negativo significa mais próximo da câmera
+    
+    ang_frontal = math.degrees(math.atan2(dy, abs(dz)))
+    ang_lateral = math.degrees(math.atan2(dy, dx))
+    ang_rotacao = math.degrees(math.atan2(abs(dx), abs(dz)))
+    
+    return ang_frontal, ang_lateral, ang_rotacao
+
 with PoseLandmarker.create_from_options(options) as landmarker:
-    print("APLICAÇÃO INICIADA COM ALERTA SONORO E VISUAL LIMPO!")
+    print("APLICAÇÃO INICIADA COM MONITORAMENTO ANATÔMICO EM 3D!")
     
     while webcam.isOpened():
         sucesso, frame = webcam.read()
@@ -68,41 +102,58 @@ with PoseLandmarker.create_from_options(options) as landmarker:
 
         frame = cv2.flip(frame, 1)
         altura_tela, largura_tela, _ = frame.shape
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # TRATAMENTO DE IMAGEM DA WEB-CAM
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l_tratado = clahe.apply(l)
+        lab_tratado = cv2.merge((l_tratado, a, b))
+        frame_tratado = cv2.cvtColor(lab_tratado, cv2.COLOR_LAB2BGR)
+        frame_tratado = cv2.filter2D(frame_tratado, -1, kernel_nitidez)
+        frame_rgb = cv2.cvtColor(frame_tratado, cv2.COLOR_BGR2RGB)
+
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         timestamp = int(webcam.get(cv2.CAP_PROP_POS_MSEC))
         
         resultado = landmarker.detect_for_video(mp_image, timestamp)
 
-        y_nariz = None
-        y_linha_ombros = None
+        pontos_validos = False
+        n_landmark = oe_landmark = od_landmark = None
+        pos_x_n = pos_y_n = pos_x_oe = pos_y_oe = pos_x_od = pos_y_od = 0
 
         if resultado.pose_landmarks:
             for landmarks in resultado.pose_landmarks:
-                pos_x_nariz = int(landmarks[0].x * largura_tela)
-                pos_y_nariz = int(landmarks[0].y * altura_tela)
-                
-                pos_x_ombro_esq = int(landmarks[11].x * largura_tela)
-                pos_y_ombro_esq = int(landmarks[11].y * altura_tela)
-                
-                pos_x_ombro_dir = int(landmarks[12].x * largura_tela)
-                pos_y_ombro_dir = int(landmarks[12].y * altura_tela)
+                if len(landmarks) > 12:
+                    n_landmark = landmarks[0]
+                    oe_landmark = landmarks[11]
+                    od_landmark = landmarks[12]
+                    
+                    pos_x_n = int(n_landmark.x * largura_tela)
+                    pos_y_n = int(n_landmark.y * altura_tela)
+                    pos_x_oe = int(oe_landmark.x * largura_tela)
+                    pos_y_oe = int(oe_landmark.y * altura_tela)
+                    pos_x_od = int(od_landmark.x * largura_tela)
+                    pos_y_od = int(od_landmark.y * altura_tela)
+                    
+                    pontos_validos = True
 
-                y_linha_ombros = (pos_y_ombro_esq + pos_y_ombro_dir) / 2
-                y_nariz = pos_y_nariz
-
-                # Desenha APENAS os pontos discretos de feedback por cima do vídeo
-                cv2.circle(frame, (pos_x_nariz, pos_y_nariz), 6, (255, 255, 0), cv2.FILLED)
-                cv2.circle(frame, (pos_x_ombro_esq, pos_y_ombro_esq), 6, (0, 255, 255), cv2.FILLED)
-                cv2.circle(frame, (pos_x_ombro_dir, pos_y_ombro_dir), 6, (0, 255, 255), cv2.FILLED)
+                    # Desenha os feedbacks visuais na tela
+                    cv2.circle(frame, (pos_x_n, pos_y_n), 6, (255, 255, 0), cv2.FILLED)
+                    cv2.circle(frame, (pos_x_oe, pos_y_oe), 6, (0, 255, 255), cv2.FILLED)
+                    cv2.circle(frame, (pos_x_od, pos_y_od), 6, (0, 255, 255), cv2.FILLED)
+                    
+                    x_c = int((pos_x_oe + pos_x_od) / 2)
+                    y_c = int((pos_y_oe + pos_y_od) / 2)
+                    cv2.line(frame, (pos_x_oe, pos_y_oe), (pos_x_od, pos_y_od), (0, 255, 0), 2)
+                    cv2.line(frame, (x_c, y_c), (pos_x_n, pos_y_n), (255, 0, 0), 2)
 
         if comando_calibrar:
             comando_calibrar = False  
-            if y_nariz is not None and y_linha_ombros is not None:
-                distancia_referencia = y_linha_ombros - y_nariz
+            if pontos_validos:
+                ref_frontal, ref_lateral, ref_rotacao = calcular_angulos_3d(n_landmark, oe_landmark, od_landmark)
                 calibrado = True
                 tempo_inicio_sessao = time.time()
-                print("Sistema Calibrado!")
+                print(f"Calibrado! F:{ref_frontal:.1f}° | L:{ref_lateral:.1f}° | R:{ref_rotacao:.1f}°")
 
         postura_critica = False
         texto_status = ""
@@ -112,45 +163,61 @@ with PoseLandmarker.create_from_options(options) as landmarker:
             texto_status = "Clique em CALIBRAR para iniciar"
             cor_texto = (0, 0, 0)
         else:
-            if y_nariz is not None and y_linha_ombros is not None:
-                distancia_atual = y_linha_ombros - y_nariz
-                limite_critico = distancia_referencia * 0.83
+            # =========================================================================
+            # NOVA LÓGICA DE SEGURANÇA BLINDADA: Perda de pontos = Postura Ruim
+            # =========================================================================
+            postura_errada = False
+            falha_IA = False
 
-                if distancia_atual < limite_critico:
-                    if tempo_inicio_postura_ruim is None:
-                        tempo_inicio_postura_ruim = time.time()
-                    
-                    segundos_passados = time.time() - tempo_inicio_postura_ruim
+            if pontos_validos:
+                # Sistema está lendo pontos, avalia os ângulos normalmente
+                ang_frontal, ang_lateral, ang_rotacao = calcular_angulos_3d(n_landmark, oe_landmark, od_landmark)
+                
+                desvio_frontal = abs(ang_frontal - ref_frontal) > 5.0  
+                desvio_lateral = abs(ang_lateral - ref_lateral) > 10.0  
+                desvio_rotacao = abs(ang_rotacao - ref_rotacao) > 15.0  
+                postura_errada = desvio_frontal or desvio_lateral or desvio_rotacao
+            else:
+                # Pontos sumiram (Oclusão/Cabeça para trás). Aciona Postura Errada imediatamente
+                postura_errada = True
+                falha_IA = True
 
-                    if segundos_passados >= 5.0:
-                        postura_critica = True 
-                        texto_status = "ALERTA: CORRIJA SUA POSTURA!"
-                        cor_texto = (0, 0, 255) 
+            # =========================================================================
 
-                        if not alerta_ativo_atualmente:
-                            contador_alertas += 1
-                            alerta_ativo_atualmente = True
-                            momento_inicio_alerta = time.time()
-                            
-                        # Emissão do som a cada 1.5 segundos
-                        if time.time() - ultimo_bip > 1.5:
-                            winsound.Beep(1000, 250) 
-                            ultimo_bip = time.time()
-                    else:
-                        tempo_restante = 5 - int(segundos_passados)
-                        texto_status = f"Postura Ruim... Alertando em: {tempo_restante}s"
-                        cor_texto = (0, 165, 255) 
+            if postura_errada:
+                if tempo_inicio_postura_ruim is None:
+                    tempo_inicio_postura_ruim = time.time()
+                
+                segundos_passados = time.time() - tempo_inicio_postura_ruim
+
+                if segundos_passados >= 5.0:
+                    postura_critica = True 
+                    texto_status = "ALERTA: CORRIJA SUA POSTURA!" if not falha_IA else "ALERTA: REFERENCIA PERDIDA / POSTURA RUIM"
+                    cor_texto = (0, 0, 255) 
+
+                    if not alerta_ativo_atualmente:
+                        contador_alertas += 1
+                        alerta_ativo_atualmente = True
+                        momento_inicio_alerta = time.time()
+                        
+                    if time.time() - ultimo_bip > 1.5:
+                        winsound.Beep(1000, 250) 
+                        ultimo_bip = time.time()
                 else:
-                    tempo_inicio_postura_ruim = None
-                    texto_status = "Postura: OK"
-                    cor_texto = (0, 150, 0) 
+                    tempo_restante = 5 - int(segundos_passados)
+                    texto_status = f"Postura Inadequada... Alerta em: {tempo_restante}s" if not falha_IA else f"Buscando referências... Alerta em: {tempo_restante}s"
+                    cor_texto = (0, 165, 255) 
+            else:
+                tempo_inicio_postura_ruim = None
+                texto_status = "Postura: OK"
+                cor_texto = (0, 150, 0) 
 
-                    if alerta_ativo_atualmente:
-                        tempo_duracao_alerta = time.time() - momento_inicio_alerta
-                        tempo_total_postura_ruim += tempo_duracao_alerta
-                        alerta_ativo_atualmente = False
+                if alerta_ativo_atualmente:
+                    tempo_duracao_alerta = time.time() - momento_inicio_alerta
+                    tempo_total_postura_ruim += tempo_duracao_alerta
+                    alerta_ativo_atualmente = False
 
-        # Interface gráfica moderna com transparência
+        # Interface gráfica com transparência
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (largura_tela, 50), (255, 255, 255), cv2.FILLED)
         cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
@@ -174,7 +241,7 @@ with PoseLandmarker.create_from_options(options) as landmarker:
 webcam.release()
 cv2.destroyAllWindows()
 
-# Processamento do relatório final (TXT)
+# PROCESSAMENTO DO RELATÓRIO FINAL
 if calibrado and tempo_inicio_sessao is not None:
     tempo_total_monitorado = time.time() - tempo_inicio_sessao
     tempo_total_postura_correta = max(0.0, tempo_total_monitorado - tempo_total_postura_ruim)
@@ -202,9 +269,16 @@ if calibrado and tempo_inicio_sessao is not None:
     print("\n" + relatorio_texto)
     
     try:
-        with open("relatorio_postura.txt", "w", encoding="utf-8") as arquivo:
+        pasta_relatorios = "relatorios"
+        if not os.path.exists(pasta_relatorios):
+            os.makedirs(pasta_relatorios)
+            
+        timestamp_arquivo = time.strftime("%Y%m%d_%H%M%S")
+        nome_arquivo = os.path.join(pasta_relatorios, f"relatorio_postura_{timestamp_arquivo}.txt")
+        
+        with open(nome_arquivo, "w", encoding="utf-8") as arquivo:
             arquivo.write(relatorio_texto)
-        print("💾 Relatório salvo com sucesso em 'relatorio_postura.txt'!")
+        print(f"💾 Relatório histórico salvo com sucesso em '{nome_arquivo}'!")
     except Exception as e:
         print(f"❌ Erro ao salvar o arquivo de texto: {e}")
 else:

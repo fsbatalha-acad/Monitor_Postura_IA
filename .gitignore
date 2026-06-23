@@ -7,7 +7,7 @@ build/
 *.task
 
 # Arquivos locais de relatório gerados por testes
-relatorio_postura.txt
+relatorios/
 
 # Ambientes virtuais e cache do Python
 __pycache__/
